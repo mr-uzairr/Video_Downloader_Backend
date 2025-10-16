@@ -40,11 +40,15 @@ def ascii_fallback_filename(name: str, max_length: int = 200) -> str:
     Create an ASCII-only fallback filename by normalizing and replacing
     non-ASCII characters with underscores and truncating to max_length.
     """
+    # Normalize (NFKD) and remove combining marks, convert to ascii where possible
     normalized = unicodedata.normalize("NFKD", name)
+    # Keep only ASCII characters; replace others with underscore
     ascii_only = "".join((c if ord(c) < 128 else "_") for c in normalized)
+    # Collapse sequences of underscores
     ascii_only = "_".join(filter(None, (part for part in ascii_only.split("_"))))
     if not ascii_only:
         ascii_only = "video"
+    # truncate and return
     if len(ascii_only) > max_length:
         ascii_only = ascii_only[:max_length]
     return ascii_only
@@ -55,96 +59,93 @@ def content_disposition_header(filename: str) -> str:
     Build a Content-Disposition header that includes an ASCII fallback
     filename and an RFC 5987 encoded UTF-8 filename* parameter for Unicode names.
     """
+    # Ensure extension part isn't lost
+    # Try latin-1 encoding; if it succeeds, use simple filename param (legacy)
     try:
         filename.encode("latin-1")
     except UnicodeEncodeError:
+        # Need RFC 5987 encoding for UTF-8
         ascii_name = ascii_fallback_filename(filename)
+        # percent-encode the UTF-8 bytes
         quoted = quote(filename, safe="")
+        # include both ascii fallback and UTF-8 encoded filename*
         return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
     else:
+        # latin-1 works, safe to use directly
         return f'attachment; filename="{filename}"'
 
 
 @app.get("/download")
-async def download_video(
-    url: str = Query(...),
-    format: str = Query("best"),
-    cookies: Optional[str] = Query(None),
-    reencode: bool = Query(False),
-):
+async def download_video(url: str = Query(...), format: str = Query("best"), cookies: Optional[str] = Query(None)):
     """
     Download a video using yt-dlp and stream it back to the client.
 
-    Query params:
-      - url: video url (required)
-      - format: yt-dlp format string (optional)
-      - cookies: path to a cookies file on the server OR raw cookie contents (optional)
-      - reencode: bool flag that forces ffmpeg re-encoding to mp4 (H.264 + AAC) if True
+    Optional query param:
+      - cookies: path to a cookies file on the server OR raw cookie contents
+                 (if your deployment supports passing cookies this way).
+                 Use cautiously - prefer server-side cookie file handling or secure upload.
     """
     uid = uuid.uuid4().hex[:10]
     temp_dir = tempfile.gettempdir()
     output_template = os.path.join(temp_dir, f"{uid}.%(ext)s")
 
     # Rotate user-agent
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
 
-    # Prefer mp4 formats when possible to avoid VP9/AV1 containers/codecs on iOS
-    preferred_format = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-
-    # Build base yt-dlp options
+    # Basic yt-dlp options
     ydl_opts = {
-        "format": preferred_format if format == "best" else format,
-        "outtmpl": output_template,
-        "quiet": True,
-        "merge_output_format": "mp4",
-        "retries": 5,
-        "continuedl": True,
-        "noprogress": True,
-        "http_headers": headers,
-        "nocheckcertificate": True,
+        'format': format,
+        'outtmpl': output_template,
+        'quiet': True,
+        'merge_output_format': 'mp4',
+        'retries': 5,
+        'continuedl': True,
+        'noprogress': True,
+        'http_headers': headers,
+        'nocheckcertificate': True,
+        # Do not restrict filename on disk to keep the real extension available
     }
 
-    # If reencode is requested, configure ffmpeg/yt-dlp to recode to mp4 (h264/aac)
-    if reencode:
-        # Instruct yt-dlp to re-encode the resulting video to mp4 using ffmpeg.
-        # 'recode_video' is a shorthand; for finer control you can use postprocessors and postprocessor_args.
-        ydl_opts["recode_video"] = "mp4"
-        ydl_opts["prefer_ffmpeg"] = True
-        # Optional: enforce codecs via postprocessor args (uncomment if needed)
-        # ydl_opts["postprocessor_args"] = ["-c:v", "libx264", "-c:a", "aac", "-preset", "fast"]
-
-    # Cookie handling: accept a server-side path or raw cookie text (caution: security)
-    tmp_cookie_path = None
+    # If cookies arg is provided and looks like a path on the server, try to use it.
+    # NOTE: for security, validate and sanitize if you accept arbitrary paths from clients.
     if cookies:
+        # If the path exists, assume it's a cookiefile path
         if os.path.exists(cookies):
-            ydl_opts["cookiefile"] = cookies
+            ydl_opts['cookiefile'] = cookies
         else:
+            # If the string contains likely cookie format (a simple heuristic),
+            # write it to a temp cookies file for yt-dlp to use.
             try:
                 tmp_cookie_path = os.path.join(temp_dir, f"{uid}.cookies.txt")
                 with open(tmp_cookie_path, "w", encoding="utf-8") as cf:
                     cf.write(cookies)
-                ydl_opts["cookiefile"] = tmp_cookie_path
+                ydl_opts['cookiefile'] = tmp_cookie_path
             except Exception:
+                # ignore cookie writing errors and proceed without cookiefile
                 tmp_cookie_path = None
+    else:
+        tmp_cookie_path = None
 
     actual_file_path = None
     info = None
 
     try:
-        # Try to extract metadata first to get a good title/extension (skip download)
+        # First try to extract metadata (safe, skip download) to get title/extension if possible
         info_opts = dict(ydl_opts)
-        info_opts["skip_download"] = True
+        info_opts['skip_download'] = True
         try:
             with yt_dlp.YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception:
+            # If metadata extraction fails for some sites, we'll attempt a direct download anyway
             info = None
 
-        # Perform the download
+        # Now perform the download (yt-dlp will write to output_template)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Use download() to fetch and write the file
             ydl.download([url])
 
-        # Locate the downloaded file (the outtmpl begins with uid)
+        # Find the actual file in temp_dir that starts with uid
         for fname in os.listdir(temp_dir):
             if fname.startswith(uid):
                 actual_file_path = os.path.join(temp_dir, fname)
@@ -153,22 +154,25 @@ async def download_video(
         if not actual_file_path or not os.path.exists(actual_file_path):
             raise HTTPException(status_code=500, detail="Download failed or file not found on server.")
 
-        # If we didn't get good metadata earlier, try to probe the actual filename
+        # Determine filename for Content-Disposition
         title = None
         extension = None
         if info:
             title = info.get("title")
             extension = info.get("ext")
+        # Fallbacks
         if not title:
+            # derive from actual filename if possible
             title = os.path.splitext(os.path.basename(actual_file_path))[0] or f"video_{uid}"
         if not extension:
+            # attempt to infer extension from actual file
             extension = os.path.splitext(actual_file_path)[1].lstrip(".") or "mp4"
 
-        # Sanitize and build filename
+        # sanitize simple slash/backslash
         title_safe = title.replace("/", "-").replace("\\", "-")
         filename = f"{title_safe}.{extension}"
 
-        # Build safe Content-Disposition header
+        # Build Content-Disposition header safely
         disposition = content_disposition_header(filename)
 
         async def async_iterfile(chunk_size: int = 64 * 1024):
@@ -185,44 +189,34 @@ async def download_video(
                     os.unlink(actual_file_path)
                 except Exception:
                     pass
-                # Remove temporary cookie file if we wrote one
-                try:
-                    if tmp_cookie_path and os.path.exists(tmp_cookie_path):
-                        os.unlink(tmp_cookie_path)
-                except Exception:
-                    pass
 
         return StreamingResponse(
             async_iterfile(),
             media_type="application/octet-stream",
-            headers={"Content-Disposition": disposition},
+            headers={"Content-Disposition": disposition}
         )
 
     except yt_dlp.utils.DownloadError as e:
+        # Provide helpful detail for client while logging full traceback server-side
         tb = traceback.format_exc()
         print("yt-dlp DownloadError:", tb)
-        # Clean up tmp cookie if any
-        try:
-            if tmp_cookie_path and os.path.exists(tmp_cookie_path):
-                os.unlink(tmp_cookie_path)
-        except Exception:
-            pass
         raise HTTPException(status_code=502, detail=f"Download error: {str(e)}")
     except Exception as e:
         tb = traceback.format_exc()
         print("Unhandled error during download:", tb)
-        # Clean up tmp cookie if any
+        # If a cookie temp file was written, attempt to remove it
         try:
             if tmp_cookie_path and os.path.exists(tmp_cookie_path):
                 os.unlink(tmp_cookie_path)
         except Exception:
             pass
+        # Provide the message in detail so clients can surface it (avoid leaking secrets)
         raise HTTPException(status_code=500, detail=f"Error during download: {str(e)}")
 
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to the Social Media Video Downloader API. Use /download?url=<video_url>&format=<video_format>&reencode=1 to request re-encoding when necessary."}
+    return {"message": "Welcome to the Social Media Video Downloader API. Use /download?url=<video_url>&format=<video_format> to download videos."}
 
 
 if __name__ == "__main__":
