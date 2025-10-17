@@ -7,7 +7,7 @@ from typing import Optional
 from urllib.parse import quote
 import unicodedata
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
@@ -33,6 +33,15 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36'
 ]
+
+
+def _safe_remove(path: str) -> None:
+    """Best-effort remove a file path; swallow errors."""
+    try:
+        if path and os.path.exists(path):
+            os.unlink(path)
+    except Exception:
+        pass
 
 
 def ascii_fallback_filename(name: str, max_length: int = 200) -> str:
@@ -76,7 +85,7 @@ def content_disposition_header(filename: str) -> str:
 
 
 @app.get("/download")
-async def download_video(url: str = Query(...), format: str = Query("best"), cookies: Optional[str] = Query(None)):
+async def download_video(background_tasks: BackgroundTasks, url: str = Query(...), format: str = Query("best"), cookies: Optional[str] = Query(None)):
     """
     Download a video using yt-dlp and stream it back to the client.
 
@@ -105,6 +114,8 @@ async def download_video(url: str = Query(...), format: str = Query("best"), coo
         'nocheckcertificate': True,
         # Do not restrict filename on disk to keep the real extension available
     }
+    # Initialize temp cookie path variable (used for cleanup if we create one)
+    tmp_cookie_path = None
 
     # If cookies arg is provided and looks like a path on the server, try to use it.
     # NOTE: for security, validate and sanitize if you accept arbitrary paths from clients.
@@ -119,12 +130,40 @@ async def download_video(url: str = Query(...), format: str = Query("best"), coo
                 tmp_cookie_path = os.path.join(temp_dir, f"{uid}.cookies.txt")
                 with open(tmp_cookie_path, "w", encoding="utf-8") as cf:
                     cf.write(cookies)
+                # Restrict permissions to owner read/write only
+                try:
+                    os.chmod(tmp_cookie_path, 0o600)
+                except Exception:
+                    pass
                 ydl_opts['cookiefile'] = tmp_cookie_path
+                # Ensure the temp cookie file is removed after response
+                background_tasks.add_task(_safe_remove, tmp_cookie_path)
             except Exception:
                 # ignore cookie writing errors and proceed without cookiefile
                 tmp_cookie_path = None
-    else:
-        tmp_cookie_path = None
+
+    # If the client didn't provide cookies, allow environment-based cookies
+    # Useful for deployments where you want to hard-code cookies for sites like YouTube
+    if 'cookiefile' not in ydl_opts:
+        env_cookie_file = os.getenv('YT_COOKIE_FILE_PATH')
+        env_cookie_string = os.getenv('YT_COOKIE_STRING')
+        if env_cookie_file and os.path.exists(env_cookie_file):
+            ydl_opts['cookiefile'] = env_cookie_file
+        elif env_cookie_string:
+            try:
+                tmp_cookie_path = os.path.join(temp_dir, f"{uid}.env.cookies.txt")
+                with open(tmp_cookie_path, "w", encoding="utf-8") as cf:
+                    cf.write(env_cookie_string)
+                # Restrict permissions to owner read/write only
+                try:
+                    os.chmod(tmp_cookie_path, 0o600)
+                except Exception:
+                    pass
+                ydl_opts['cookiefile'] = tmp_cookie_path
+                # Schedule removal after response
+                background_tasks.add_task(_safe_remove, tmp_cookie_path)
+            except Exception:
+                tmp_cookie_path = None
 
     actual_file_path = None
     info = None
