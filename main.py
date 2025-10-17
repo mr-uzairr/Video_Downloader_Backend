@@ -7,11 +7,12 @@ from typing import Optional
 from urllib.parse import quote
 import unicodedata
 
-from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException, BackgroundTasks, UploadFile, File, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from dotenv import load_dotenv
+import base64
 
 # Load environment variables if present
 load_dotenv()
@@ -315,6 +316,64 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
 @app.get("/")
 async def root():
     return {"message": "Welcome to the Social Media Video Downloader API. Use /download?url=<video_url>&format=<video_format> to download videos."}
+
+
+@app.post('/admin/cookies')
+async def admin_upload_cookies(background_tasks: BackgroundTasks, file: UploadFile | None = File(None), cookies_b64: str | None = None, authorization: str | None = Header(None)):
+    """Admin endpoint to upload or set the server cookie file.
+
+    - Accepts multipart file upload (field `file`) or JSON/form field `cookies_b64` (base64).
+    - Requires header: Authorization: Bearer <ADMIN_TOKEN>
+    - Writes to file specified by YT_COOKIE_FILE_PATH or default /srv/secrets/youtube_cookies.txt
+    """
+    admin_token = os.getenv('ADMIN_TOKEN')
+    if not admin_token:
+        raise HTTPException(status_code=403, detail='Admin token not configured on server.')
+
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail='Missing Authorization header')
+
+    token = authorization.split(' ', 1)[1]
+    if token != admin_token:
+        raise HTTPException(status_code=403, detail='Invalid admin token')
+
+    # Determine destination path
+    dest_path = os.getenv('YT_COOKIE_FILE_PATH') or os.path.join(tempfile.gettempdir(), 'youtube_cookies.txt')
+
+    # Write uploaded file if provided
+    try:
+        if file:
+            with open(dest_path, 'wb') as out_f:
+                content = await file.read()
+                out_f.write(content)
+        elif cookies_b64:
+            try:
+                decoded = base64.b64decode(cookies_b64)
+            except Exception:
+                # If not valid base64, treat as raw text
+                decoded = cookies_b64.encode('utf-8')
+            with open(dest_path, 'wb') as out_f:
+                out_f.write(decoded)
+        else:
+            raise HTTPException(status_code=400, detail='No file or cookies_b64 provided')
+
+        # Restrict permissions
+        try:
+            os.chmod(dest_path, 0o600)
+        except Exception:
+            pass
+
+        # Optionally schedule cleanup if writing to /tmp (we keep cookie file persistent by default)
+        # background_tasks.add_task(_safe_remove, dest_path)
+
+        print('Admin cookie file updated; stored at', dest_path)
+        return {'status': 'ok', 'path': dest_path}
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print('Error saving admin cookie file:', tb)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
