@@ -107,7 +107,7 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
         'outtmpl': output_template,
         'quiet': True,
         'merge_output_format': 'mp4',
-        'retries': 5,
+        'retries': 10,
         'continuedl': True,
         'noprogress': True,
         'http_headers': headers,
@@ -143,27 +143,86 @@ async def download_video(background_tasks: BackgroundTasks, url: str = Query(...
                 tmp_cookie_path = None
 
     # If the client didn't provide cookies, allow environment-based cookies
-    # Useful for deployments where you want to hard-code cookies for sites like YouTube
+    # Auto-select order (most reliable first):
+    # 1) YT_COOKIE_FILE_PATH (existing file)
+    # 2) YT_COOKIE_STRING_B64 (base64-encoded cookie contents)
+    # 3) YT_COOKIE_STRING (raw cookie contents)
+    # 4) cookiesfrombrowser (YT_COOKIES_FROM_BROWSER)
+    # 5) proxy (YT_PROXY)
     if 'cookiefile' not in ydl_opts:
         env_cookie_file = os.getenv('YT_COOKIE_FILE_PATH')
+        env_cookie_string_b64 = os.getenv('YT_COOKIE_STRING_B64')
         env_cookie_string = os.getenv('YT_COOKIE_STRING')
+        chosen_method = None
+
+        # 1) file on disk
         if env_cookie_file and os.path.exists(env_cookie_file):
             ydl_opts['cookiefile'] = env_cookie_file
-        elif env_cookie_string:
+            chosen_method = 'env_file'
+
+        # 2) base64 cookie string
+        elif env_cookie_string_b64:
             try:
+                decoded = None
+                try:
+                    import base64
+
+                    decoded = base64.b64decode(env_cookie_string_b64).decode('utf-8')
+                except Exception:
+                    # fall back to treating it as raw if decode fails
+                    decoded = env_cookie_string_b64
+
                 tmp_cookie_path = os.path.join(temp_dir, f"{uid}.env.cookies.txt")
                 with open(tmp_cookie_path, "w", encoding="utf-8") as cf:
-                    cf.write(env_cookie_string)
-                # Restrict permissions to owner read/write only
+                    cf.write(decoded)
                 try:
                     os.chmod(tmp_cookie_path, 0o600)
                 except Exception:
                     pass
                 ydl_opts['cookiefile'] = tmp_cookie_path
-                # Schedule removal after response
                 background_tasks.add_task(_safe_remove, tmp_cookie_path)
+                chosen_method = 'env_b64'
             except Exception:
                 tmp_cookie_path = None
+
+        # 3) raw cookie string
+        elif env_cookie_string:
+            try:
+                tmp_cookie_path = os.path.join(temp_dir, f"{uid}.env.cookies.txt")
+                with open(tmp_cookie_path, "w", encoding="utf-8") as cf:
+                    cf.write(env_cookie_string)
+                try:
+                    os.chmod(tmp_cookie_path, 0o600)
+                except Exception:
+                    pass
+                ydl_opts['cookiefile'] = tmp_cookie_path
+                background_tasks.add_task(_safe_remove, tmp_cookie_path)
+                chosen_method = 'env_raw'
+            except Exception:
+                tmp_cookie_path = None
+
+        # 4) cookiesfrombrowser
+        cookies_from_browser = os.getenv('YT_COOKIES_FROM_BROWSER')
+        if 'cookiefile' not in ydl_opts and cookies_from_browser:
+            ydl_opts['cookiesfrombrowser'] = cookies_from_browser
+            chosen_method = chosen_method or 'cookiesfrombrowser'
+
+        # Log chosen non-sensitive method for debugging
+        if chosen_method:
+            print(f"Cookie method selected: {chosen_method}")
+
+    # Optionally support extracting cookies from a local browser profile (if available on the server)
+    # Example: set YT_COOKIES_FROM_BROWSER=chrome or firefox
+    cookies_from_browser = os.getenv('YT_COOKIES_FROM_BROWSER')
+    if 'cookiefile' not in ydl_opts and cookies_from_browser:
+        # yt-dlp supports the 'cookiesfrombrowser' option
+        ydl_opts['cookiesfrombrowser'] = cookies_from_browser
+
+    # Optionally support using a proxy (residential proxy recommended for bypassing rate-limits)
+    # Example: export YT_PROXY=http://username:pass@host:port
+    proxy = os.getenv('YT_PROXY') or os.getenv('HTTP_PROXY') or os.getenv('HTTPS_PROXY')
+    if proxy:
+        ydl_opts['proxy'] = proxy
 
     actual_file_path = None
     info = None
